@@ -313,6 +313,11 @@ if uploaded:
                 st.session_state["last_date_label"] = date_label
                 st.session_state["last_init_msgs"] = init_msgs
 
+    except Exception as e:
+        st.error(f"오류: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
 # ── 결과 표시 (session_state 기반, 다운로드해도 유지됨) ──────
 if "last_results" in st.session_state:
     st.markdown("---")
@@ -351,8 +356,3 @@ if "last_results" in st.session_state:
         with st.expander("오류 목록"):
             for e in st.session_state["last_errors"]:
                 st.warning(e)
-
-    except Exception as e:
-        st.error(f"오류: {e}")
-        import traceback
-        st.code(traceback.format_exc())
