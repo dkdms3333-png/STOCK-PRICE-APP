@@ -8,7 +8,6 @@ from bs4 import BeautifulSoup
 import re
 import time
 import io
-from pykrx import stock as krx_stock
 
 st.set_page_config(page_title="종가 캡처", layout="centered")
 st.title("코스닥/코스피 종가 조회")
@@ -20,16 +19,33 @@ def clean_stock_name(name: str) -> str:
 
 @st.cache_data(ttl=3600 * 12, show_spinner="전종목 코드 로딩 중...")
 def get_code_map() -> dict:
-    """KRX 전종목 코드맵 (코스피+코스닥). 12시간 캐시."""
+    """KRX API로 전종목 코드맵 반환 (코스피+코스닥). 12시간 캐시."""
+    url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "http://data.krx.co.kr/",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
     today = date.today().strftime("%Y%m%d")
     code_map = {}
-    for market in ["KOSPI", "KOSDAQ"]:
+    for market_id in ["STK", "KSQ"]:  # STK=코스피, KSQ=코스닥
         try:
-            tickers = krx_stock.get_market_ticker_list(today, market=market)
-            for code in tickers:
-                name = krx_stock.get_market_ticker_name(code)
-                code_map[name] = code
-                code_map[clean_stock_name(name)] = code
+            payload = {
+                "bld": "dbms/MDC/STAT/standard/MDCSTAT01901",
+                "mktId": market_id,
+                "trdDd": today,
+                "share": "1",
+                "money": "1",
+                "csvxls_isNo": "false",
+            }
+            res = requests.post(url, data=payload, headers=headers, timeout=15)
+            items = res.json().get("OutBlock_1", [])
+            for item in items:
+                name = item.get("ISU_ABBRV", "").strip()
+                code = item.get("ISU_SRT_CD", "").strip()
+                if name and code:
+                    code_map[name] = code
+                    code_map[clean_stock_name(name)] = code
         except Exception:
             pass
     return code_map
