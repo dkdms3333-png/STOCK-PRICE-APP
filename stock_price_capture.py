@@ -8,7 +8,31 @@ from bs4 import BeautifulSoup
 import re
 import time
 import io
+import os
+import subprocess
+import zipfile
 import FinanceDataReader as fdr
+
+
+# ── Playwright Chromium 자동 설치 (Streamlit Cloud) ──────────
+@st.cache_resource
+def ensure_playwright_browser():
+    """Streamlit Cloud에서 Chromium 자동 설치."""
+    try:
+        from playwright.sync_api import sync_playwright
+        # 설치 확인 — 없으면 다운로드
+        try:
+            with sync_playwright() as p:
+                p.chromium.executable_path
+        except Exception:
+            subprocess.run(
+                ["playwright", "install", "chromium"],
+                check=False, capture_output=True, timeout=180,
+            )
+        return True
+    except Exception as e:
+        st.warning(f"브라우저 초기화 실패: {e}")
+        return False
 
 st.set_page_config(page_title="종가 캡처", layout="centered")
 st.title("코스닥/코스피 종가 조회")
@@ -80,6 +104,50 @@ def find_prev_trading_day(code: str, target_date: date) -> tuple[date | None, in
     return None, None
 
 
+# ── 스크린샷 (네이버 시세 페이지) ────────────────────────────
+def find_page_for_date(code: str, target_date: date) -> int:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    date_str = target_date.strftime("%Y.%m.%d")
+    today = date.today()
+    trading_days = (today - target_date).days * 5 // 7
+    start_page = max(1, trading_days // 10 - 2)
+    for page in range(start_page, start_page + 10):
+        url = f"https://finance.naver.com/item/sise_day.nhn?code={code}&page={page}"
+        res = requests.get(url, headers=headers, timeout=10)
+        res.encoding = "euc-kr"
+        soup = BeautifulSoup(res.text, "html.parser")
+        for row in soup.select("table.type2 tr"):
+            tds = row.select("td")
+            if tds and tds[0].text.strip() == date_str:
+                return page
+            if tds and tds[0].text.strip() and tds[0].text.strip() < date_str:
+                break
+    return start_page
+
+
+def capture_naver_chart(code: str, actual_date: date) -> bytes | None:
+    """네이버 시세 페이지 스크린샷 → 바이트 반환."""
+    from playwright.sync_api import sync_playwright
+    target_page = find_page_for_date(code, actual_date)
+    sise_url = f"https://finance.naver.com/item/sise.naver?code={code}"
+    day_url  = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={target_page}"
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            pw_page = browser.new_page(viewport={"width": 1280, "height": 1300})
+            pw_page.goto(sise_url, wait_until="domcontentloaded", timeout=20000)
+            time.sleep(1.5)
+            day_frame = pw_page.frame(name="day")
+            if day_frame:
+                day_frame.goto(day_url, wait_until="domcontentloaded", timeout=15000)
+                time.sleep(1)
+            img_bytes = pw_page.screenshot(clip={"x": 0, "y": 0, "width": 1280, "height": 1300})
+            browser.close()
+            return img_bytes
+    except Exception:
+        return None
+
+
 # ── 엑셀 생성 (다운로드용 메모리 버퍼) ──────────────────────
 def save_excel(rows: list[dict]) -> bytes:
     wb = openpyxl.Workbook()
@@ -129,6 +197,8 @@ st.caption("**펀드명**, **종목명** 두 열 포함. 헤더 행 필수.")
 
 uploaded = st.file_uploader("종목 목록 엑셀 (.xlsx)", type=["xlsx"])
 target_date = st.date_input("기준일", value=date.today())
+capture_enabled = st.checkbox("📸 네이버 시세 화면 캡처 (분기결산 증빙용)", value=False,
+                              help="체크 시 각 종목별 네이버 화면을 PNG로 저장. 처리 시간이 길어집니다.")
 st.caption("⚠️ 기준일이 휴장일이면 직전 영업일 종가로 자동 대체됩니다. (엑셀에 빨간색 표시)")
 
 if uploaded:
@@ -151,8 +221,12 @@ if uploaded:
                 if not code_map:
                     st.error("종목코드 로딩 실패. 잠시 후 다시 시도해주세요.")
                     st.stop()
+                if capture_enabled:
+                    with st.spinner("브라우저 초기화 중 (최초 1회 1~2분)..."):
+                        ensure_playwright_browser()
                 results = []
                 errors = []
+                captures: dict[str, bytes] = {}  # 파일명 → 이미지 바이트
                 progress = st.progress(0)
                 status = st.empty()
 
@@ -190,6 +264,16 @@ if uploaded:
                         "actual_date": actual_date.strftime("%Y-%m-%d"),
                         "price": price,
                     })
+
+                    if capture_enabled:
+                        status.text(f"캡처 중: {stock_name} ({i+1}/{len(df)})")
+                        img = capture_naver_chart(code, actual_date)
+                        if img:
+                            date_label = target_date.strftime("%Y%m%d")
+                            captures[f"{stock_name}_{date_label}.png"] = img
+                        else:
+                            errors.append(f"{stock_name}: 캡처 실패")
+
                     progress.progress((i + 1) / len(df))
 
                 status.text("완료!")
@@ -199,14 +283,26 @@ if uploaded:
                 st.dataframe(result_df, use_container_width=True)
 
                 excel_rows = [r for r in results if isinstance(r["price"], int)]
+                date_label = target_date.strftime("%Y%m%d")
                 if excel_rows:
-                    date_label = target_date.strftime("%Y%m%d")
                     excel_bytes = save_excel(excel_rows)
                     st.download_button(
                         label="📥 엑셀 다운로드",
                         data=excel_bytes,
                         file_name=f"종가현황_{date_label}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+                if captures:
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fname, data in captures.items():
+                            zf.writestr(fname, data)
+                    st.download_button(
+                        label=f"📸 캡처 이미지 ZIP 다운로드 ({len(captures)}장)",
+                        data=zip_buf.getvalue(),
+                        file_name=f"종가캡처_{date_label}.zip",
+                        mime="application/zip",
                     )
 
                 if errors:
