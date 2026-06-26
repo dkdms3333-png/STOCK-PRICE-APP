@@ -134,7 +134,9 @@ def find_page_for_date(code: str, target_date: date) -> int:
 
 
 def capture_naver_chart(code: str, actual_date: date) -> tuple[bytes | None, str]:
-    """네이버 시세 페이지 스크린샷 → (바이트, 에러메시지)."""
+    """네이버 시세 페이지 스크린샷 → (바이트, 에러메시지).
+    종목명(상단) + 기준일이 포함된 일별시세를 한 화면에 캡처.
+    """
     from playwright.sync_api import sync_playwright
     target_page = find_page_for_date(code, actual_date)
     sise_url = f"https://finance.naver.com/item/sise.naver?code={code}"
@@ -142,14 +144,14 @@ def capture_naver_chart(code: str, actual_date: date) -> tuple[bytes | None, str
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            pw_page = browser.new_page(viewport={"width": 1280, "height": 1300})
+            pw_page = browser.new_page(viewport={"width": 1280, "height": 1600})
             pw_page.goto(sise_url, wait_until="domcontentloaded", timeout=20000)
-            time.sleep(1.5)
+            time.sleep(2)
             day_frame = pw_page.frame(name="day")
             if day_frame:
                 day_frame.goto(day_url, wait_until="domcontentloaded", timeout=15000)
-                time.sleep(1)
-            img_bytes = pw_page.screenshot(clip={"x": 0, "y": 0, "width": 1280, "height": 1300})
+                time.sleep(1.5)
+            img_bytes = pw_page.screenshot(full_page=True)
             browser.close()
             return img_bytes, ""
     except Exception as e:
@@ -229,18 +231,16 @@ if uploaded:
                 if not code_map:
                     st.error("종목코드 로딩 실패. 잠시 후 다시 시도해주세요.")
                     st.stop()
+                init_msgs = []
                 if capture_enabled:
                     with st.spinner("브라우저 초기화 중 (최초 1회 1~2분)..."):
-                        ok, msgs = ensure_playwright_browser()
-                    with st.expander("브라우저 초기화 로그"):
-                        for m in msgs:
-                            st.text(m)
+                        ok, init_msgs = ensure_playwright_browser()
                     if not ok:
                         st.error("브라우저 초기화 실패. 캡처 없이 종가 조회만 진행합니다.")
                         capture_enabled = False
                 results = []
                 errors = []
-                captures: dict[str, bytes] = {}  # 파일명 → 이미지 바이트
+                captures: dict[str, bytes] = {}
                 progress = st.progress(0)
                 status = st.empty()
 
@@ -292,37 +292,65 @@ if uploaded:
 
                 status.text("완료!")
 
-                result_df = pd.DataFrame(results)
-                result_df.columns = ["펀드명", "종목명", "기준일", "실제조회일", "종가(원)"]
-                st.dataframe(result_df, use_container_width=True)
-
                 excel_rows = [r for r in results if isinstance(r["price"], int)]
                 date_label = target_date.strftime("%Y%m%d")
-                if excel_rows:
-                    excel_bytes = save_excel(excel_rows)
-                    st.download_button(
-                        label="📥 엑셀 다운로드",
-                        data=excel_bytes,
-                        file_name=f"종가현황_{date_label}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+                excel_bytes = save_excel(excel_rows) if excel_rows else None
 
+                zip_bytes = None
                 if captures:
                     zip_buf = io.BytesIO()
                     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
                         for fname, data in captures.items():
                             zf.writestr(fname, data)
-                    st.download_button(
-                        label=f"📸 캡처 이미지 ZIP 다운로드 ({len(captures)}장)",
-                        data=zip_buf.getvalue(),
-                        file_name=f"종가캡처_{date_label}.zip",
-                        mime="application/zip",
-                    )
+                    zip_bytes = zip_buf.getvalue()
 
-                if errors:
-                    with st.expander("오류 목록"):
-                        for e in errors:
-                            st.warning(e)
+                # session_state에 저장 → 다운로드 클릭 후에도 결과 유지
+                st.session_state["last_results"] = results
+                st.session_state["last_errors"] = errors
+                st.session_state["last_excel"] = excel_bytes
+                st.session_state["last_zip"] = zip_bytes
+                st.session_state["last_zip_count"] = len(captures)
+                st.session_state["last_date_label"] = date_label
+                st.session_state["last_init_msgs"] = init_msgs
+
+# ── 결과 표시 (session_state 기반, 다운로드해도 유지됨) ──────
+if "last_results" in st.session_state:
+    st.markdown("---")
+    st.markdown("### 결과")
+    result_df = pd.DataFrame(st.session_state["last_results"])
+    result_df.columns = ["펀드명", "종목명", "기준일", "실제조회일", "종가(원)"]
+    st.dataframe(result_df, use_container_width=True)
+
+    col_a, col_b = st.columns(2)
+    date_label = st.session_state["last_date_label"]
+    if st.session_state.get("last_excel"):
+        with col_a:
+            st.download_button(
+                label="📥 엑셀 다운로드",
+                data=st.session_state["last_excel"],
+                file_name=f"종가현황_{date_label}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_excel",
+            )
+    if st.session_state.get("last_zip"):
+        with col_b:
+            st.download_button(
+                label=f"📸 캡처 ZIP 다운로드 ({st.session_state['last_zip_count']}장)",
+                data=st.session_state["last_zip"],
+                file_name=f"종가캡처_{date_label}.zip",
+                mime="application/zip",
+                key="dl_zip",
+            )
+
+    if st.session_state.get("last_init_msgs"):
+        with st.expander("브라우저 초기화 로그"):
+            for m in st.session_state["last_init_msgs"]:
+                st.text(m)
+
+    if st.session_state.get("last_errors"):
+        with st.expander("오류 목록"):
+            for e in st.session_state["last_errors"]:
+                st.warning(e)
 
     except Exception as e:
         st.error(f"오류: {e}")
