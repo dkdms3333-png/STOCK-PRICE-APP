@@ -133,46 +133,46 @@ def find_page_for_date(code: str, target_date: date) -> int:
     return start_page
 
 
-def capture_naver_chart(code: str, actual_date: date) -> tuple[bytes | None, str]:
-    """네이버 시세 페이지 스크린샷 → (바이트, 에러메시지).
-    종목명(상단) + 기준일이 포함된 일별시세를 한 화면에 캡처.
+def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str]:
+    """네이버 시세 페이지 캡처 → ({파일접미사: 바이트}, 에러메시지).
+    - 요약: sise.naver (종목명 + 시세 정보)
+    - 일별시세: sise_day (기준일이 포함된 일별 표)
     """
     from playwright.sync_api import sync_playwright
     target_page = find_page_for_date(code, actual_date)
     sise_url = f"https://finance.naver.com/item/sise.naver?code={code}"
     day_url  = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={target_page}"
     date_str = actual_date.strftime("%Y.%m.%d")
+    out = {}
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            pw_page = browser.new_page(viewport={"width": 1280, "height": 1600})
-            pw_page.goto(sise_url, wait_until="domcontentloaded", timeout=20000)
+
+            # 1) 종목 요약 페이지 (종목명 + 현재 시세)
+            page1 = browser.new_page(viewport={"width": 1280, "height": 900})
+            page1.goto(sise_url, wait_until="domcontentloaded", timeout=20000)
             time.sleep(2)
+            out["요약"] = page1.screenshot(full_page=True)
+            page1.close()
 
-            # day iframe을 찾고 기준일이 있는 페이지로 이동
-            day_frame = None
-            for f in pw_page.frames:
-                if f.name == "day" or "sise_day" in (f.url or ""):
-                    day_frame = f
-                    break
+            # 2) 일별시세 페이지 (기준일 포함)
+            page2 = browser.new_page(viewport={"width": 800, "height": 700})
+            page2.goto(day_url, wait_until="domcontentloaded", timeout=20000)
+            try:
+                page2.wait_for_function(
+                    f"document.body.innerText.includes('{date_str}')",
+                    timeout=5000,
+                )
+            except Exception:
+                pass
+            time.sleep(1)
+            out["일별시세"] = page2.screenshot(full_page=True)
+            page2.close()
 
-            if day_frame:
-                day_frame.goto(day_url, wait_until="load", timeout=15000)
-                # 기준일이 실제로 보일 때까지 대기 (최대 5초)
-                try:
-                    day_frame.wait_for_function(
-                        f"document.body.innerText.includes('{date_str}')",
-                        timeout=5000,
-                    )
-                except Exception:
-                    pass
-                time.sleep(1)
-
-            img_bytes = pw_page.screenshot(full_page=True)
             browser.close()
-            return img_bytes, ""
+            return out, ""
     except Exception as e:
-        return None, str(e)[:200]
+        return out, str(e)[:200]
 
 
 # ── 엑셀 생성 (다운로드용 메모리 버퍼) ──────────────────────
@@ -298,12 +298,14 @@ if uploaded:
 
                     if capture_enabled:
                         status.text(f"캡처 중: {stock_name} ({i+1}/{len(df)})")
-                        img, err = capture_naver_chart(code, actual_date)
-                        if img:
-                            date_label = target_date.strftime("%Y%m%d")
-                            captures[f"{stock_name}_{date_label}.png"] = img
-                        else:
+                        imgs, err = capture_naver_chart(code, actual_date)
+                        date_label = target_date.strftime("%Y%m%d")
+                        for suffix, data in imgs.items():
+                            captures[f"{stock_name}_{date_label}_{suffix}.png"] = data
+                        if not imgs:
                             errors.append(f"{stock_name}: 캡처 실패 — {err}")
+                        elif err:
+                            errors.append(f"{stock_name}: 일부 캡처 실패 — {err}")
 
                     progress.progress((i + 1) / len(df))
 
