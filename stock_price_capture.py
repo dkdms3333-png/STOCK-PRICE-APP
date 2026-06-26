@@ -141,16 +141,33 @@ def capture_naver_chart(code: str, actual_date: date) -> tuple[bytes | None, str
     target_page = find_page_for_date(code, actual_date)
     sise_url = f"https://finance.naver.com/item/sise.naver?code={code}"
     day_url  = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={target_page}"
+    date_str = actual_date.strftime("%Y.%m.%d")
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             pw_page = browser.new_page(viewport={"width": 1280, "height": 1600})
             pw_page.goto(sise_url, wait_until="domcontentloaded", timeout=20000)
             time.sleep(2)
-            day_frame = pw_page.frame(name="day")
+
+            # day iframe을 찾고 기준일이 있는 페이지로 이동
+            day_frame = None
+            for f in pw_page.frames:
+                if f.name == "day" or "sise_day" in (f.url or ""):
+                    day_frame = f
+                    break
+
             if day_frame:
-                day_frame.goto(day_url, wait_until="domcontentloaded", timeout=15000)
-                time.sleep(1.5)
+                day_frame.goto(day_url, wait_until="load", timeout=15000)
+                # 기준일이 실제로 보일 때까지 대기 (최대 5초)
+                try:
+                    day_frame.wait_for_function(
+                        f"document.body.innerText.includes('{date_str}')",
+                        timeout=5000,
+                    )
+                except Exception:
+                    pass
+                time.sleep(1)
+
             img_bytes = pw_page.screenshot(full_page=True)
             browser.close()
             return img_bytes, ""
