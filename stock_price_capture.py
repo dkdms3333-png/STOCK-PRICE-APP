@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 import re
 import time
 import io
+import FinanceDataReader as fdr
 
 st.set_page_config(page_title="종가 캡처", layout="centered")
 st.title("코스닥/코스피 종가 조회")
@@ -17,28 +18,27 @@ def clean_stock_name(name: str) -> str:
     return re.sub(r'[㈜㈔\s]', '', name).strip()
 
 
-_code_cache: dict[str, str] = {}
+@st.cache_data(ttl=3600 * 12, show_spinner="전종목 코드 로딩 중 (최초 1회)...")
+def get_code_map() -> dict:
+    """FinanceDataReader로 코스피+코스닥 전종목 코드맵 반환."""
+    code_map = {}
+    for market in ["KOSPI", "KOSDAQ"]:
+        try:
+            df = fdr.StockListing(market)
+            for _, row in df.iterrows():
+                name = str(row.get("Name", "")).strip()
+                code = str(row.get("Code", "")).strip()
+                if name and code:
+                    code_map[name] = code
+                    code_map[clean_stock_name(name)] = code
+        except Exception:
+            pass
+    return code_map
 
-def get_stock_code(name: str, code_map: dict = None) -> str | None:
-    """네이버 금융 검색 페이지에서 종목코드 반환."""
-    clean = clean_stock_name(name.strip())
-    if clean in _code_cache:
-        return _code_cache[clean]
-    try:
-        url = f"https://finance.naver.com/search/searchList.naver?query={requests.utils.quote(clean)}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=10)
-        res.encoding = "euc-kr"
-        soup = BeautifulSoup(res.text, "html.parser")
-        link = soup.select_one("td.tit a[href*='code=']")
-        if link:
-            m = re.search(r'code=([\w]+)', link["href"])
-            if m:
-                _code_cache[clean] = m.group(1)
-                return m.group(1)
-    except Exception:
-        pass
-    return None
+
+def get_stock_code(name: str, code_map: dict) -> str | None:
+    name = name.strip()
+    return code_map.get(name) or code_map.get(clean_stock_name(name))
 
 
 # ── 종가 조회 ────────────────────────────────────────────────
@@ -147,6 +147,10 @@ if uploaded:
             st.info(f"총 {len(df)}개 종목")
 
             if st.button("종가 조회 시작", type="primary"):
+                code_map = get_code_map()
+                if not code_map:
+                    st.error("종목코드 로딩 실패. 잠시 후 다시 시도해주세요.")
+                    st.stop()
                 results = []
                 errors = []
                 progress = st.progress(0)
@@ -157,7 +161,7 @@ if uploaded:
                     stock_name = str(row[col_name]).strip()
                     status.text(f"처리 중: {stock_name} ({i+1}/{len(df)})")
 
-                    code = get_stock_code(stock_name)
+                    code = get_stock_code(stock_name, code_map)
                     if not code:
                         errors.append(f"{stock_name}: 종목코드 없음")
                         results.append({
