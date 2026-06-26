@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 import re
 import time
 import io
+from pykrx import stock as krx_stock
 
 st.set_page_config(page_title="종가 캡처", layout="centered")
 st.title("코스닥/코스피 종가 조회")
@@ -17,29 +18,26 @@ def clean_stock_name(name: str) -> str:
     return re.sub(r'[㈜㈔\s]', '', name).strip()
 
 
-_code_cache: dict[str, str] = {}
+@st.cache_data(ttl=3600 * 12, show_spinner="전종목 코드 로딩 중...")
+def get_code_map() -> dict:
+    """KRX 전종목 코드맵 (코스피+코스닥). 12시간 캐시."""
+    today = date.today().strftime("%Y%m%d")
+    code_map = {}
+    for market in ["KOSPI", "KOSDAQ"]:
+        try:
+            tickers = krx_stock.get_market_ticker_list(today, market=market)
+            for code in tickers:
+                name = krx_stock.get_market_ticker_name(code)
+                code_map[name] = code
+                code_map[clean_stock_name(name)] = code
+        except Exception:
+            pass
+    return code_map
 
-def get_stock_code(name: str, code_map: dict = None) -> str | None:
-    """네이버 금융 자동완성 API로 종목명 → 코드 반환."""
-    clean = clean_stock_name(name.strip())
 
-    if clean in _code_cache:
-        return _code_cache[clean]
-
-    try:
-        url = f"https://ac.finance.naver.com/ac?q={requests.utils.quote(clean)}&q_enc=UTF-8&t_koreng=1&st=111&r_format=json&r_enc=UTF-8&r_lt=111&r_unicode=0&r_escape=1"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=5)
-        data = res.json()
-        items = data.get("items", [[]])[0]
-        if items:
-            code = items[0][1] if len(items[0]) > 1 else None
-            if code:
-                _code_cache[clean] = code
-                return code
-    except Exception:
-        pass
-    return None
+def get_stock_code(name: str, code_map: dict) -> str | None:
+    name = name.strip()
+    return code_map.get(name) or code_map.get(clean_stock_name(name))
 
 
 # ── 종가 조회 ────────────────────────────────────────────────
@@ -81,7 +79,7 @@ def find_prev_trading_day(code: str, target_date: date) -> tuple[date | None, in
     return None, None
 
 
-# ── 엑셀 생성 (메모리 버퍼) ──────────────────────────────────
+# ── 엑셀 생성 (다운로드용 메모리 버퍼) ──────────────────────
 def save_excel(rows: list[dict]) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -148,6 +146,11 @@ if uploaded:
             st.info(f"총 {len(df)}개 종목")
 
             if st.button("종가 조회 시작", type="primary"):
+                code_map = get_code_map()
+                if not code_map:
+                    st.error("종목코드 로딩 실패. 잠시 후 다시 시도해주세요.")
+                    st.stop()
+
                 results = []
                 errors = []
                 progress = st.progress(0)
@@ -158,7 +161,7 @@ if uploaded:
                     stock_name = str(row[col_name]).strip()
                     status.text(f"처리 중: {stock_name} ({i+1}/{len(df)})")
 
-                    code = get_stock_code(stock_name)
+                    code = get_stock_code(stock_name, code_map)
                     if not code:
                         errors.append(f"{stock_name}: 종목코드 없음")
                         results.append({
@@ -195,7 +198,6 @@ if uploaded:
                 result_df.columns = ["펀드명", "종목명", "기준일", "실제조회일", "종가(원)"]
                 st.dataframe(result_df, use_container_width=True)
 
-                # 엑셀 다운로드
                 excel_rows = [r for r in results if isinstance(r["price"], int)]
                 if excel_rows:
                     date_label = target_date.strftime("%Y%m%d")
