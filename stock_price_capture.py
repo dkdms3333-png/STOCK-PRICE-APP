@@ -17,43 +17,28 @@ def clean_stock_name(name: str) -> str:
     return re.sub(r'[㈜㈔\s]', '', name).strip()
 
 
-@st.cache_data(ttl=3600 * 12, show_spinner="전종목 코드 로딩 중...")
-def get_code_map() -> dict:
-    """KRX API로 전종목 코드맵 반환 (코스피+코스닥). 12시간 캐시."""
-    url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "http://data.krx.co.kr/",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    today = date.today().strftime("%Y%m%d")
-    code_map = {}
-    for market_id in ["STK", "KSQ"]:  # STK=코스피, KSQ=코스닥
-        try:
-            payload = {
-                "bld": "dbms/MDC/STAT/standard/MDCSTAT01901",
-                "mktId": market_id,
-                "trdDd": today,
-                "share": "1",
-                "money": "1",
-                "csvxls_isNo": "false",
-            }
-            res = requests.post(url, data=payload, headers=headers, timeout=15)
-            items = res.json().get("OutBlock_1", [])
-            for item in items:
-                name = item.get("ISU_ABBRV", "").strip()
-                code = item.get("ISU_SRT_CD", "").strip()
-                if name and code:
-                    code_map[name] = code
-                    code_map[clean_stock_name(name)] = code
-        except Exception:
-            pass
-    return code_map
+_code_cache: dict[str, str] = {}
 
-
-def get_stock_code(name: str, code_map: dict) -> str | None:
-    name = name.strip()
-    return code_map.get(name) or code_map.get(clean_stock_name(name))
+def get_stock_code(name: str, code_map: dict = None) -> str | None:
+    """네이버 금융 검색 페이지에서 종목코드 반환."""
+    clean = clean_stock_name(name.strip())
+    if clean in _code_cache:
+        return _code_cache[clean]
+    try:
+        url = f"https://finance.naver.com/search/searchList.naver?query={requests.utils.quote(clean)}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=10)
+        res.encoding = "euc-kr"
+        soup = BeautifulSoup(res.text, "html.parser")
+        link = soup.select_one("td.tit a[href*='code=']")
+        if link:
+            m = re.search(r'code=([\w]+)', link["href"])
+            if m:
+                _code_cache[clean] = m.group(1)
+                return m.group(1)
+    except Exception:
+        pass
+    return None
 
 
 # ── 종가 조회 ────────────────────────────────────────────────
@@ -162,11 +147,6 @@ if uploaded:
             st.info(f"총 {len(df)}개 종목")
 
             if st.button("종가 조회 시작", type="primary"):
-                code_map = get_code_map()
-                if not code_map:
-                    st.error("종목코드 로딩 실패. 잠시 후 다시 시도해주세요.")
-                    st.stop()
-
                 results = []
                 errors = []
                 progress = st.progress(0)
@@ -177,7 +157,7 @@ if uploaded:
                     stock_name = str(row[col_name]).strip()
                     status.text(f"처리 중: {stock_name} ({i+1}/{len(df)})")
 
-                    code = get_stock_code(stock_name, code_map)
+                    code = get_stock_code(stock_name)
                     if not code:
                         errors.append(f"{stock_name}: 종목코드 없음")
                         results.append({
