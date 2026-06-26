@@ -12,6 +12,7 @@ import os
 import subprocess
 import zipfile
 import FinanceDataReader as fdr
+from PIL import Image
 
 
 # ── Playwright Chromium 자동 설치 (Streamlit Cloud) ──────────
@@ -170,6 +171,22 @@ def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str]:
             page2.close()
 
             browser.close()
+
+            # 두 캡처를 위아래로 단순 결합 (수정 없이 이어붙이기만)
+            if "요약" in out and "일별시세" in out:
+                try:
+                    img1 = Image.open(io.BytesIO(out["요약"]))
+                    img2 = Image.open(io.BytesIO(out["일별시세"]))
+                    width = max(img1.width, img2.width)
+                    combined = Image.new("RGB", (width, img1.height + img2.height), "white")
+                    combined.paste(img1, (0, 0))
+                    combined.paste(img2, (0, img1.height))
+                    buf = io.BytesIO()
+                    combined.save(buf, format="PNG")
+                    return {"전체": buf.getvalue()}, ""
+                except Exception as e:
+                    return out, f"이미지 결합 실패: {str(e)[:150]}"
+
             return out, ""
     except Exception as e:
         return out, str(e)[:200]
