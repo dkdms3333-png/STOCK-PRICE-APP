@@ -17,22 +17,30 @@ import FinanceDataReader as fdr
 # ── Playwright Chromium 자동 설치 (Streamlit Cloud) ──────────
 @st.cache_resource
 def ensure_playwright_browser():
-    """Streamlit Cloud에서 Chromium 자동 설치."""
+    """Streamlit Cloud에서 Chromium 자동 설치. 결과 메시지 반환."""
+    msgs = []
+    try:
+        result = subprocess.run(
+            ["playwright", "install", "chromium"],
+            capture_output=True, timeout=300, text=True,
+        )
+        msgs.append(f"install rc={result.returncode}")
+        if result.stderr:
+            msgs.append(f"stderr: {result.stderr[-300:]}")
+    except Exception as e:
+        msgs.append(f"install exception: {e}")
+
+    # 실제로 동작하는지 테스트
     try:
         from playwright.sync_api import sync_playwright
-        # 설치 확인 — 없으면 다운로드
-        try:
-            with sync_playwright() as p:
-                p.chromium.executable_path
-        except Exception:
-            subprocess.run(
-                ["playwright", "install", "chromium"],
-                check=False, capture_output=True, timeout=180,
-            )
-        return True
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            b.close()
+        msgs.append("launch OK")
+        return True, msgs
     except Exception as e:
-        st.warning(f"브라우저 초기화 실패: {e}")
-        return False
+        msgs.append(f"launch failed: {e}")
+        return False, msgs
 
 st.set_page_config(page_title="종가 캡처", layout="centered")
 st.title("코스닥/코스피 종가 조회")
@@ -125,8 +133,8 @@ def find_page_for_date(code: str, target_date: date) -> int:
     return start_page
 
 
-def capture_naver_chart(code: str, actual_date: date) -> bytes | None:
-    """네이버 시세 페이지 스크린샷 → 바이트 반환."""
+def capture_naver_chart(code: str, actual_date: date) -> tuple[bytes | None, str]:
+    """네이버 시세 페이지 스크린샷 → (바이트, 에러메시지)."""
     from playwright.sync_api import sync_playwright
     target_page = find_page_for_date(code, actual_date)
     sise_url = f"https://finance.naver.com/item/sise.naver?code={code}"
@@ -143,9 +151,9 @@ def capture_naver_chart(code: str, actual_date: date) -> bytes | None:
                 time.sleep(1)
             img_bytes = pw_page.screenshot(clip={"x": 0, "y": 0, "width": 1280, "height": 1300})
             browser.close()
-            return img_bytes
-    except Exception:
-        return None
+            return img_bytes, ""
+    except Exception as e:
+        return None, str(e)[:200]
 
 
 # ── 엑셀 생성 (다운로드용 메모리 버퍼) ──────────────────────
@@ -223,7 +231,13 @@ if uploaded:
                     st.stop()
                 if capture_enabled:
                     with st.spinner("브라우저 초기화 중 (최초 1회 1~2분)..."):
-                        ensure_playwright_browser()
+                        ok, msgs = ensure_playwright_browser()
+                    with st.expander("브라우저 초기화 로그"):
+                        for m in msgs:
+                            st.text(m)
+                    if not ok:
+                        st.error("브라우저 초기화 실패. 캡처 없이 종가 조회만 진행합니다.")
+                        capture_enabled = False
                 results = []
                 errors = []
                 captures: dict[str, bytes] = {}  # 파일명 → 이미지 바이트
@@ -267,12 +281,12 @@ if uploaded:
 
                     if capture_enabled:
                         status.text(f"캡처 중: {stock_name} ({i+1}/{len(df)})")
-                        img = capture_naver_chart(code, actual_date)
+                        img, err = capture_naver_chart(code, actual_date)
                         if img:
                             date_label = target_date.strftime("%Y%m%d")
                             captures[f"{stock_name}_{date_label}.png"] = img
                         else:
-                            errors.append(f"{stock_name}: 캡처 실패")
+                            errors.append(f"{stock_name}: 캡처 실패 — {err}")
 
                     progress.progress((i + 1) / len(df))
 
