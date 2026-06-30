@@ -174,17 +174,34 @@ def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str]:
                 time.sleep(0.5)
             time.sleep(0.5)
 
-            # 일별시세 iframe의 bottom 좌표 측정 → 그 지점까지만 세로로 컷 (가로는 전체)
+            # 부모 페이지의 두 번째 "일별시세" 헤더 위치를 찾아 그 직전에서 컷
             clip_h = page.evaluate("""
                 () => {
-                    const f = document.querySelector('iframe[name=day]');
-                    if (!f) return null;
-                    const r = f.getBoundingClientRect();
-                    return Math.ceil(r.bottom + window.scrollY);
+                    const iframe = document.querySelector('iframe[name=day]');
+                    const iframeTop = iframe ? iframe.getBoundingClientRect().top + window.scrollY : 0;
+                    // 부모 문서에서 "일별시세" 텍스트를 가진 요소들 찾기
+                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+                    const hits = [];
+                    let n;
+                    while (n = walker.nextNode()) {
+                        const t = (n.textContent || '').trim();
+                        if (t === '일별시세' || t.startsWith('일별시세')) {
+                            const r = n.getBoundingClientRect();
+                            if (r.height < 100 && r.width < 300) {
+                                hits.push(r.top + window.scrollY);
+                            }
+                        }
+                    }
+                    // iframe 아래에 있는 첫 "일별시세" 위치 반환
+                    const below = hits.filter(y => y > iframeTop + 100).sort((a,b) => a-b);
+                    if (below.length > 0) return Math.floor(below[0]) - 10;
+                    // 없으면 iframe bottom
+                    if (iframe) return Math.ceil(iframe.getBoundingClientRect().bottom + window.scrollY) + 20;
+                    return null;
                 }
             """)
             if clip_h:
-                img = page.screenshot(clip={"x": 0, "y": 0, "width": 1280, "height": clip_h + 20})
+                img = page.screenshot(clip={"x": 0, "y": 0, "width": 1280, "height": clip_h})
             else:
                 img = page.screenshot(full_page=True)
 
