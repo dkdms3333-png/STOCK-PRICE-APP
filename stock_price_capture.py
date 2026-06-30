@@ -174,7 +174,25 @@ def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str]:
                 time.sleep(0.5)
             time.sleep(0.5)
 
-            img = page.screenshot(full_page=True)
+            # 일별시세 iframe의 bottom 좌표를 측정해서 그 지점까지만 캡처
+            bbox = page.evaluate("""
+                () => {
+                    const f = document.querySelector('iframe[name=day]');
+                    if (!f) return null;
+                    const r = f.getBoundingClientRect();
+                    return {
+                        bottom: Math.ceil(r.bottom + window.scrollY),
+                        right: Math.ceil(r.right + window.scrollX)
+                    };
+                }
+            """)
+            if bbox:
+                clip_h = bbox["bottom"] + 20
+                clip_w = min(1280, max(bbox["right"] + 20, 900))
+                img = page.screenshot(clip={"x": 0, "y": 0, "width": clip_w, "height": clip_h})
+            else:
+                img = page.screenshot(full_page=True)
+
             browser.close()
             err = "" if ok else "기준일 로드 확인 실패 (캡처는 진행됨)"
             return {"전체": img}, err
