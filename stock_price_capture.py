@@ -135,61 +135,51 @@ def find_page_for_date(code: str, target_date: date) -> int:
 
 
 def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str]:
-    """네이버 시세 페이지 캡처 → ({파일접미사: 바이트}, 에러메시지).
-    - 요약: sise.naver (종목명 + 시세 정보)
-    - 일별시세: sise_day (기준일이 포함된 일별 표)
+    """sise.naver 페이지를 그대로 열고, 일별시세 iframe만 기준일 페이지로 넘김.
+    페이지 구조/내용 수정 없음 — iframe의 페이지 번호만 네비게이션.
     """
     from playwright.sync_api import sync_playwright
     target_page = find_page_for_date(code, actual_date)
     sise_url = f"https://finance.naver.com/item/sise.naver?code={code}"
     day_url  = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={target_page}"
     date_str = actual_date.strftime("%Y.%m.%d")
-    out = {}
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-
-            # 1) 종목 요약 페이지 (종목명 + 현재 시세)
-            page1 = browser.new_page(viewport={"width": 1280, "height": 900})
-            page1.goto(sise_url, wait_until="domcontentloaded", timeout=20000)
+            page = browser.new_page(viewport={"width": 1280, "height": 1600})
+            page.goto(sise_url, wait_until="domcontentloaded", timeout=20000)
             time.sleep(2)
-            out["요약"] = page1.screenshot(full_page=True)
-            page1.close()
 
-            # 2) 일별시세 페이지 (기준일 포함)
-            page2 = browser.new_page(viewport={"width": 800, "height": 700})
-            page2.goto(day_url, wait_until="domcontentloaded", timeout=20000)
-            try:
-                page2.wait_for_function(
-                    f"document.body.innerText.includes('{date_str}')",
-                    timeout=5000,
-                )
-            except Exception:
-                pass
-            time.sleep(1)
-            out["일별시세"] = page2.screenshot(full_page=True)
-            page2.close()
+            # day iframe의 src를 기준일 페이지로 변경 (사용자가 페이지 번호 클릭한 것과 동일)
+            page.evaluate(f"""
+                var f = document.querySelector('iframe[name=day]');
+                if (f) f.src = '{day_url}';
+            """)
 
+            # iframe이 기준일 텍스트를 포함할 때까지 대기 (최대 8초)
+            deadline = time.time() + 8
+            ok = False
+            while time.time() < deadline:
+                for f in page.frames:
+                    if f.name == "day":
+                        try:
+                            txt = f.evaluate("document.body.innerText")
+                            if date_str in txt:
+                                ok = True
+                                break
+                        except Exception:
+                            pass
+                if ok:
+                    break
+                time.sleep(0.5)
+            time.sleep(0.5)
+
+            img = page.screenshot(full_page=True)
             browser.close()
-
-            # 두 캡처를 위아래로 단순 결합 (수정 없이 이어붙이기만)
-            if "요약" in out and "일별시세" in out:
-                try:
-                    img1 = Image.open(io.BytesIO(out["요약"]))
-                    img2 = Image.open(io.BytesIO(out["일별시세"]))
-                    width = max(img1.width, img2.width)
-                    combined = Image.new("RGB", (width, img1.height + img2.height), "white")
-                    combined.paste(img1, (0, 0))
-                    combined.paste(img2, (0, img1.height))
-                    buf = io.BytesIO()
-                    combined.save(buf, format="PNG")
-                    return {"전체": buf.getvalue()}, ""
-                except Exception as e:
-                    return out, f"이미지 결합 실패: {str(e)[:150]}"
-
-            return out, ""
+            err = "" if ok else "기준일 로드 확인 실패 (캡처는 진행됨)"
+            return {"전체": img}, err
     except Exception as e:
-        return out, str(e)[:200]
+        return {}, str(e)[:200]
 
 
 # ── 엑셀 생성 (다운로드용 메모리 버퍼) ──────────────────────
