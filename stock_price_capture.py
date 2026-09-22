@@ -9,6 +9,7 @@ import re
 import time
 import io
 import os
+import json
 import subprocess
 import zipfile
 import FinanceDataReader as fdr
@@ -51,6 +52,12 @@ def clean_stock_name(name: str) -> str:
     return re.sub(r'[㈜㈔\s]', '', name).strip()
 
 
+# 투자명부 표기와 실제 상장명이 달라 자동 매칭이 안 되는 종목들 (발견될 때마다 추가)
+STOCK_NAME_ALIASES = {
+    "뉴엔에이아이": "뉴엔AI",
+}
+
+
 @st.cache_data(ttl=3600 * 12, show_spinner="전종목 코드 로딩 중 (최초 1회)...")
 def get_code_map() -> dict:
     """FinanceDataReader로 코스피+코스닥 전종목 코드맵 반환."""
@@ -71,36 +78,152 @@ def get_code_map() -> dict:
 
 def get_stock_code(name: str, code_map: dict) -> str | None:
     name = name.strip()
-    return code_map.get(name) or code_map.get(clean_stock_name(name))
+    code = code_map.get(name) or code_map.get(clean_stock_name(name))
+    if code:
+        return code
+    alias = STOCK_NAME_ALIASES.get(clean_stock_name(name))
+    if alias:
+        return code_map.get(alias) or code_map.get(clean_stock_name(alias))
+    return None
+
+
+# ── 투자명부 자동 리스트업 ───────────────────────────────────
+LEDGER_DIR = r"G:\공유 드라이브\4-2. 기획본부_투자관리팀\01. 투자명부"
+FUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "funds")
+
+# 투자명부 '계정명' ↔ 관리 펀드(funds/*.json) 매핑. 계정명이 없으면 None.
+FUND_ACCOUNT_MAP = {
+    "2013_성장사다리": None,
+    "2017_4차산업": "4차 산업혁명",
+    "2020_소부장": "소부장",
+    "2021_이노베이션": "이노베이션",
+    "2024_청년창업": "청년창업",
+    "2024_기술혁신전문": "기술혁신",
+}
+
+
+def load_fund_names() -> dict:
+    """funds/*.json에서 fund_id -> 표시용 fund_name 매핑."""
+    names = {}
+    if os.path.isdir(FUNDS_DIR):
+        for fname in os.listdir(FUNDS_DIR):
+            if not fname.endswith(".json"):
+                continue
+            fid = fname[:-5]
+            try:
+                with open(os.path.join(FUNDS_DIR, fname), encoding="utf-8") as f:
+                    data = json.load(f)
+                names[fid] = data.get("fund_name", fid)
+            except Exception:
+                names[fid] = fid
+    return names
+
+
+def find_ledger_file(target_date: date, max_back_months: int = 12) -> tuple[str | None, str | None]:
+    """target_date가 속한 달부터 역순으로 투자명부(YYYY년MM월말기준).xlsx 탐색."""
+    if not os.path.isdir(LEDGER_DIR):
+        return None, None
+    y, m = target_date.year, target_date.month
+    for _ in range(max_back_months):
+        fname = f"투자명부({y}년{m:02d}월말기준).xlsx"
+        fpath = os.path.join(LEDGER_DIR, fname)
+        if os.path.isfile(fpath):
+            return fpath, f"{y}년{m:02d}월말기준"
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    return None, None
+
+
+def extract_fund_stock_list(ledger_path: str, code_map: dict) -> tuple[pd.DataFrame, list[str]]:
+    """투자명부에서 잔고가 있는 모든 계정(펀드)의 상장종목(AS열 상장여부='Y')을 추출한다.
+    관리 펀드(FUND_ACCOUNT_MAP)로 매핑되는 계정은 등록된 펀드명으로 표시하고,
+    그 외 계정(다른 조합/본계정 등)도 계정명 그대로 포함한다.
+    """
+    wb = openpyxl.load_workbook(ledger_path, data_only=True)
+    ws = wb["투자명부"]
+    headers = [ws.cell(row=4, column=c).value for c in range(1, ws.max_column + 1)]
+    col_idx = {h: i + 1 for i, h in enumerate(headers) if h}
+    col_account = col_idx.get("계정명")
+    col_type = col_idx.get("구분")
+    col_company = col_idx.get("투자업체명")
+    col_listed = col_idx.get("상장여부")
+
+    if not (col_account and col_type and col_company and col_listed):
+        return pd.DataFrame(), ["투자명부 시트에서 계정명/구분/투자업체명/상장여부 열을 찾지 못했습니다."]
+
+    fund_names = load_fund_names()
+    account_to_fund_id = {account: fund_id for fund_id, account in FUND_ACCOUNT_MAP.items() if account}
+
+    by_account: dict[str, set] = {}
+    for r in range(5, ws.max_row + 1):
+        account = ws.cell(row=r, column=col_account).value
+        if not account:
+            continue
+        if (ws.cell(row=r, column=col_type).value == "잔고"
+                and str(ws.cell(row=r, column=col_listed).value).strip().upper() == "Y"):
+            name = ws.cell(row=r, column=col_company).value
+            if name:
+                by_account.setdefault(account, set()).add(str(name).strip())
+
+    notices = []
+    rows = []
+    for account, companies in sorted(by_account.items()):
+        fund_id = account_to_fund_id.get(account)
+        display_name = fund_names.get(fund_id, fund_id) if fund_id else account
+
+        no_code = [c for c in companies if not get_stock_code(c, code_map)]
+        if no_code:
+            notices.append(f"{display_name}: 상장종목이나 종목코드 미매칭 — {', '.join(sorted(no_code))} (수동 확인 필요)")
+        for name in sorted(companies):
+            rows.append({"fund": display_name, "name": name})
+
+    return pd.DataFrame(rows), notices
 
 
 # ── 종가 조회 ────────────────────────────────────────────────
-def fetch_closing_price(code: str, target_date: date) -> int | None:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    date_str = target_date.strftime("%Y.%m.%d")
-    today = date.today()
-    trading_days = (today - target_date).days * 5 // 7
-    start_page = max(1, trading_days // 10 - 2)
+# 네이버가 finance.naver.com/item/* 페이지를 stock.naver.com으로 전면 이전하면서
+# 기존 sise_day 스크래핑이 폐지됨(HTTP 410). 모바일 API로 대체.
+PRICE_PAGE_SIZE = 60
 
-    for page in range(start_page, start_page + 15):
-        url = f"https://finance.naver.com/item/sise_day.nhn?code={code}&page={page}"
-        res = requests.get(url, headers=headers, timeout=10)
-        res.encoding = "euc-kr"
-        soup = BeautifulSoup(res.text, "html.parser")
-        rows = soup.select("table.type2 tr")
+
+def _fetch_price_page(code: str, page: int) -> list[dict] | None:
+    url = f"https://m.stock.naver.com/api/stock/{code}/price?page={page}&pageSize={PRICE_PAGE_SIZE}"
+    try:
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if res.status_code != 200:
+            return None
+        rows = res.json()
+        return rows or None
+    except Exception:
+        return None
+
+
+def fetch_closing_price(code: str, target_date: date) -> int | None:
+    date_str = target_date.strftime("%Y-%m-%d")
+    today = date.today()
+    trading_days = max((today - target_date).days * 5 // 7, 0)
+    page = max(1, trading_days // PRICE_PAGE_SIZE)
+
+    for _ in range(30):
+        rows = _fetch_price_page(code, page)
+        if not rows:
+            return None
+        newest, oldest = rows[0]["localTradedAt"], rows[-1]["localTradedAt"]
         for row in rows:
-            tds = row.select("td")
-            if len(tds) < 2:
-                continue
-            row_date = tds[0].text.strip()
-            if row_date == date_str:
-                price_text = tds[1].text.strip().replace(",", "")
+            if row["localTradedAt"] == date_str:
                 try:
-                    return int(price_text)
-                except ValueError:
+                    return int(str(row["closePrice"]).replace(",", ""))
+                except (ValueError, TypeError):
                     return None
-            if row_date and row_date < date_str:
-                break
+        if date_str > newest:
+            if page == 1:
+                return None
+            page = max(1, page - 1)
+        elif date_str < oldest:
+            page += 1
+        else:
+            return None  # 범위 안이지만 해당일 없음 = 휴장일
     return None
 
 
@@ -114,99 +237,55 @@ def find_prev_trading_day(code: str, target_date: date) -> tuple[date | None, in
 
 
 # ── 스크린샷 (네이버 시세 페이지) ────────────────────────────
-def find_page_for_date(code: str, target_date: date) -> int:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    date_str = target_date.strftime("%Y.%m.%d")
-    today = date.today()
-    trading_days = (today - target_date).days * 5 // 7
-    start_page = max(1, trading_days // 10 - 2)
-    for page in range(start_page, start_page + 10):
-        url = f"https://finance.naver.com/item/sise_day.nhn?code={code}&page={page}"
-        res = requests.get(url, headers=headers, timeout=10)
-        res.encoding = "euc-kr"
-        soup = BeautifulSoup(res.text, "html.parser")
-        for row in soup.select("table.type2 tr"):
-            tds = row.select("td")
-            if tds and tds[0].text.strip() == date_str:
-                return page
-            if tds and tds[0].text.strip() and tds[0].text.strip() < date_str:
-                break
-    return start_page
+# finance.naver.com/item/* 은 전부 stock.naver.com으로 이전되어 폐지됨.
+# m.stock.naver.com 페이지가 요약+차트+일별시세 표를 한 화면에 제공하며,
+# 넓은 뷰포트로 열면 PC 화면처럼 표가 넓게 펼쳐져 표시됨(같은 페이지, 반응형 레이아웃).
+CAPTURE_WIDTH = 1280
+# 뷰포트를 넉넉히 크게 잡아 실제 스크롤이 일어나지 않게 함.
+# (긴 목록을 스크롤하면 화면 밖으로 나간 행이 가상화(virtualization)로 DOM에서
+#  사라져 캡처에서 잘려나가는 문제가 있어, 스크롤 자체를 피하는 방식으로 우회)
+CAPTURE_VIEWPORT = {"width": CAPTURE_WIDTH, "height": 15000}
 
 
 def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str]:
-    """sise.naver 페이지를 그대로 열고, 일별시세 iframe만 기준일 페이지로 넘김.
-    페이지 구조/내용 수정 없음 — iframe의 페이지 번호만 네비게이션.
+    """m.stock.naver.com 종목 시세 페이지를 PC 화면 크기로 그대로 열고, '더보기' 버튼만
+    클릭해 기준일 행이 로드될 때까지 내려간 뒤 캡처. 페이지 구조/내용 수정 없음.
     """
     from playwright.sync_api import sync_playwright
-    target_page = find_page_for_date(code, actual_date)
-    sise_url = f"https://finance.naver.com/item/sise.naver?code={code}"
-    day_url  = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={target_page}"
-    date_str = actual_date.strftime("%Y.%m.%d")
+    target_str = f"{actual_date.month:02d}. {actual_date.day:02d}."
+    url = f"https://m.stock.naver.com/domestic/stock/{code}/price"
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            page = browser.new_page(viewport={"width": 1280, "height": 1600})
-            page.goto(sise_url, wait_until="domcontentloaded", timeout=20000)
-            time.sleep(2)
+            page = browser.new_page(viewport=CAPTURE_VIEWPORT)
+            page.goto(url, wait_until="networkidle", timeout=20000)
+            page.wait_for_timeout(1000)
 
-            # day iframe의 src를 기준일 페이지로 변경 (사용자가 페이지 번호 클릭한 것과 동일)
-            page.evaluate(f"""
-                var f = document.querySelector('iframe[name=day]');
-                if (f) f.src = '{day_url}';
-            """)
-
-            # iframe이 기준일 텍스트를 포함할 때까지 대기 (최대 8초)
-            deadline = time.time() + 8
-            ok = False
-            while time.time() < deadline:
-                for f in page.frames:
-                    if f.name == "day":
-                        try:
-                            txt = f.evaluate("document.body.innerText")
-                            if date_str in txt:
-                                ok = True
-                                break
-                        except Exception:
-                            pass
-                if ok:
+            found = False
+            row_bottom = None
+            for _ in range(40):
+                loc = page.get_by_text(target_str, exact=True)
+                if loc.count() > 0:
+                    row_bottom = loc.first.evaluate(
+                        "el => el.getBoundingClientRect().bottom + window.scrollY"
+                    )
+                    found = True
                     break
-                time.sleep(0.5)
-            time.sleep(0.5)
+                more = page.query_selector("text=더보기")
+                if not more:
+                    break
+                more.click()
+                page.wait_for_timeout(400)
 
-            # 부모 페이지의 두 번째 "일별시세" 헤더 위치를 찾아 그 직전에서 컷
-            clip_h = page.evaluate("""
-                () => {
-                    const iframe = document.querySelector('iframe[name=day]');
-                    const iframeTop = iframe ? iframe.getBoundingClientRect().top + window.scrollY : 0;
-                    // 부모 문서에서 "일별시세" 텍스트를 가진 요소들 찾기
-                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
-                    const hits = [];
-                    let n;
-                    while (n = walker.nextNode()) {
-                        const t = (n.textContent || '').trim();
-                        if (t === '일별시세' || t.startsWith('일별시세')) {
-                            const r = n.getBoundingClientRect();
-                            if (r.height < 100 && r.width < 300) {
-                                hits.push(r.top + window.scrollY);
-                            }
-                        }
-                    }
-                    // iframe 아래에 있는 첫 "일별시세" 위치 반환
-                    const below = hits.filter(y => y > iframeTop + 100).sort((a,b) => a-b);
-                    if (below.length > 0) return Math.floor(below[0]) - 10;
-                    // 없으면 iframe bottom
-                    if (iframe) return Math.ceil(iframe.getBoundingClientRect().bottom + window.scrollY) + 20;
-                    return null;
-                }
-            """)
-            if clip_h:
-                img = page.screenshot(clip={"x": 0, "y": 0, "width": 1280, "height": clip_h})
+            if found and row_bottom:
+                clip_h = int(row_bottom) + 40
+                img = page.screenshot(clip={"x": 0, "y": 0, "width": CAPTURE_WIDTH, "height": clip_h})
+                err = ""
             else:
-                img = page.screenshot(full_page=True)
+                img = page.screenshot(clip={"x": 0, "y": 0, "width": CAPTURE_WIDTH, "height": 1200})
+                err = "기준일 행을 찾지 못해 상단 화면만 캡처됨"
 
             browser.close()
-            err = "" if ok else "기준일 로드 확인 실패 (캡처는 진행됨)"
             return {"전체": img}, err
     except Exception as e:
         return {}, str(e)[:200]
@@ -256,118 +335,179 @@ def save_excel(rows: list[dict]) -> bytes:
 
 
 # ── UI ───────────────────────────────────────────────────────
-st.markdown("### 1. 엑셀 업로드")
-st.caption("**펀드명**, **종목명** 두 열 포함. 헤더 행 필수.")
-
-uploaded = st.file_uploader("종목 목록 엑셀 (.xlsx)", type=["xlsx"])
+st.markdown("### 1. 기준일 / 종목 리스트")
 target_date = st.date_input("기준일", value=date.today())
+
+mode = st.radio(
+    "종목 리스트 방식",
+    ["투자명부 자동 탐색 (로컬 전용)", "투자명부 파일 업로드 (원격/공유용)", "엑셀 직접 업로드 (펀드명/종목명)"],
+    horizontal=True,
+)
+
+df = None
+col_fund, col_name = "fund", "name"
+
+if mode.startswith("투자명부 자동 탐색"):
+    st.caption(f"경로: `{LEDGER_DIR}`")
+    if st.button("투자명부 불러오기"):
+        with st.spinner("전종목 코드 확인 및 투자명부 분석 중..."):
+            code_map = get_code_map()
+            ledger_path, ledger_label = find_ledger_file(target_date)
+            if not ledger_path:
+                st.session_state.pop("auto_df", None)
+                st.error(f"{target_date:%Y년 %m월} 인근 투자명부 파일을 찾지 못했습니다. 경로/파일명을 확인해주세요.")
+            else:
+                auto_df, notices = extract_fund_stock_list(ledger_path, code_map)
+                st.session_state["auto_df"] = auto_df
+                st.session_state["auto_notices"] = notices
+                st.session_state["auto_ledger_label"] = ledger_label
+
+    if "auto_df" in st.session_state:
+        st.caption(f"사용된 투자명부: **{st.session_state['auto_ledger_label']}**")
+        for n in st.session_state.get("auto_notices", []):
+            st.warning(n)
+        df = st.session_state["auto_df"]
+
+elif mode.startswith("투자명부 파일 업로드"):
+    st.caption("투자명부 원본 파일(`투자명부(YYYY년MM월말기준).xlsx`)을 수정 없이 그대로 업로드하세요. "
+               "PC/드라이브 접근 없이도(예: 다른 동료 PC) 같은 자동 리스트업 기능을 쓸 수 있습니다.")
+    uploaded_ledger = st.file_uploader("투자명부 엑셀 (.xlsx)", type=["xlsx"], key="ledger_upload")
+    if uploaded_ledger and st.button("투자명부 분석하기"):
+        with st.spinner("전종목 코드 확인 및 투자명부 분석 중..."):
+            code_map = get_code_map()
+            auto_df, notices = extract_fund_stock_list(uploaded_ledger, code_map)
+            st.session_state["auto_df"] = auto_df
+            st.session_state["auto_notices"] = notices
+            st.session_state["auto_ledger_label"] = f"업로드 파일: {uploaded_ledger.name}"
+
+    if "auto_df" in st.session_state:
+        st.caption(f"사용된 투자명부: **{st.session_state['auto_ledger_label']}**")
+        for n in st.session_state.get("auto_notices", []):
+            st.warning(n)
+        df = st.session_state["auto_df"]
+
+else:
+    st.caption("**펀드명**, **종목명** 두 열 포함. 헤더 행 필수.")
+    uploaded = st.file_uploader("종목 목록 엑셀 (.xlsx)", type=["xlsx"])
+    if uploaded:
+        try:
+            raw_df = pd.read_excel(uploaded)
+            raw_df.columns = raw_df.columns.str.strip()
+            up_col_fund = next((c for c in raw_df.columns if "펀드" in str(c)), None)
+            up_col_name = next((c for c in raw_df.columns if "종목" in str(c)), None)
+            if not up_col_fund or not up_col_name:
+                st.error("엑셀에 '펀드명'과 '종목명' 열이 필요합니다.")
+            else:
+                df = raw_df[[up_col_fund, up_col_name]].dropna()
+                df.columns = [col_fund, col_name]
+        except Exception as e:
+            st.error(f"오류: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
 capture_enabled = st.checkbox("📸 네이버 시세 화면 캡처 (분기결산 증빙용)", value=False,
                               help="체크 시 각 종목별 네이버 화면을 PNG로 저장. 처리 시간이 길어집니다.")
 st.caption("⚠️ 기준일이 휴장일이면 직전 영업일 종가로 자동 대체됩니다. (엑셀에 빨간색 표시)")
 
-if uploaded:
+if df is not None and not df.empty:
     try:
-        df = pd.read_excel(uploaded)
-        df.columns = df.columns.str.strip()
+        st.dataframe(df, use_container_width=True)
+        st.info(f"총 {len(df)}개 종목")
 
-        col_fund = next((c for c in df.columns if "펀드" in str(c)), None)
-        col_name = next((c for c in df.columns if "종목" in str(c)), None)
+        if st.button("종가 조회 시작", type="primary"):
+            code_map = get_code_map()
+            if not code_map:
+                st.error("종목코드 로딩 실패. 잠시 후 다시 시도해주세요.")
+                st.stop()
+            init_msgs = []
+            if capture_enabled:
+                with st.spinner("브라우저 초기화 중 (최초 1회 1~2분)..."):
+                    ok, init_msgs = ensure_playwright_browser()
+                if not ok:
+                    st.error("브라우저 초기화 실패. 캡처 없이 종가 조회만 진행합니다.")
+                    capture_enabled = False
+            results = []
+            errors = []
+            captures: dict[str, bytes] = {}
+            capture_cache: dict[str, tuple[dict, str]] = {}
+            progress = st.progress(0)
+            status = st.empty()
 
-        if not col_fund or not col_name:
-            st.error("엑셀에 '펀드명'과 '종목명' 열이 필요합니다.")
-        else:
-            df = df[[col_fund, col_name]].dropna()
-            st.dataframe(df, use_container_width=True)
-            st.info(f"총 {len(df)}개 종목")
+            for i, (_, row) in enumerate(df.iterrows()):
+                fund_name = str(row[col_fund]).strip()
+                stock_name = str(row[col_name]).strip()
+                status.text(f"처리 중: {stock_name} ({i+1}/{len(df)})")
 
-            if st.button("종가 조회 시작", type="primary"):
-                code_map = get_code_map()
-                if not code_map:
-                    st.error("종목코드 로딩 실패. 잠시 후 다시 시도해주세요.")
-                    st.stop()
-                init_msgs = []
-                if capture_enabled:
-                    with st.spinner("브라우저 초기화 중 (최초 1회 1~2분)..."):
-                        ok, init_msgs = ensure_playwright_browser()
-                    if not ok:
-                        st.error("브라우저 초기화 실패. 캡처 없이 종가 조회만 진행합니다.")
-                        capture_enabled = False
-                results = []
-                errors = []
-                captures: dict[str, bytes] = {}
-                progress = st.progress(0)
-                status = st.empty()
-
-                for i, (_, row) in enumerate(df.iterrows()):
-                    fund_name = str(row[col_fund]).strip()
-                    stock_name = str(row[col_name]).strip()
-                    status.text(f"처리 중: {stock_name} ({i+1}/{len(df)})")
-
-                    code = get_stock_code(stock_name, code_map)
-                    if not code:
-                        errors.append(f"{stock_name}: 종목코드 없음")
-                        results.append({
-                            "fund": fund_name, "name": stock_name,
-                            "ref_date": target_date.strftime("%Y-%m-%d"),
-                            "actual_date": "-", "price": "코드 없음",
-                        })
-                        progress.progress((i + 1) / len(df))
-                        continue
-
-                    actual_date, price = find_prev_trading_day(code, target_date)
-
-                    if not price:
-                        errors.append(f"{stock_name}: 종가 조회 실패")
-                        results.append({
-                            "fund": fund_name, "name": stock_name,
-                            "ref_date": target_date.strftime("%Y-%m-%d"),
-                            "actual_date": "-", "price": "조회 실패",
-                        })
-                        progress.progress((i + 1) / len(df))
-                        continue
-
+                code = get_stock_code(stock_name, code_map)
+                if not code:
+                    errors.append(f"{stock_name}: 종목코드 없음")
                     results.append({
                         "fund": fund_name, "name": stock_name,
                         "ref_date": target_date.strftime("%Y-%m-%d"),
-                        "actual_date": actual_date.strftime("%Y-%m-%d"),
-                        "price": price,
+                        "actual_date": "-", "price": "코드 없음",
                     })
-
-                    if capture_enabled:
-                        status.text(f"캡처 중: {stock_name} ({i+1}/{len(df)})")
-                        imgs, err = capture_naver_chart(code, actual_date)
-                        date_label = target_date.strftime("%Y%m%d")
-                        for suffix, data in imgs.items():
-                            captures[f"{stock_name}_{date_label}_{suffix}.png"] = data
-                        if not imgs:
-                            errors.append(f"{stock_name}: 캡처 실패 — {err}")
-                        elif err:
-                            errors.append(f"{stock_name}: 일부 캡처 실패 — {err}")
-
                     progress.progress((i + 1) / len(df))
+                    continue
 
-                status.text("완료!")
+                actual_date, price = find_prev_trading_day(code, target_date)
 
-                excel_rows = [r for r in results if isinstance(r["price"], int)]
-                date_label = target_date.strftime("%Y%m%d")
-                excel_bytes = save_excel(excel_rows) if excel_rows else None
+                if not price:
+                    errors.append(f"{stock_name}: 종가 조회 실패")
+                    results.append({
+                        "fund": fund_name, "name": stock_name,
+                        "ref_date": target_date.strftime("%Y-%m-%d"),
+                        "actual_date": "-", "price": "조회 실패",
+                    })
+                    progress.progress((i + 1) / len(df))
+                    continue
 
-                zip_bytes = None
-                if captures:
-                    zip_buf = io.BytesIO()
-                    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                        for fname, data in captures.items():
-                            zf.writestr(fname, data)
-                    zip_bytes = zip_buf.getvalue()
+                results.append({
+                    "fund": fund_name, "name": stock_name,
+                    "ref_date": target_date.strftime("%Y-%m-%d"),
+                    "actual_date": actual_date.strftime("%Y-%m-%d"),
+                    "price": price,
+                })
 
-                # session_state에 저장 → 다운로드 클릭 후에도 결과 유지
-                st.session_state["last_results"] = results
-                st.session_state["last_errors"] = errors
-                st.session_state["last_excel"] = excel_bytes
-                st.session_state["last_zip"] = zip_bytes
-                st.session_state["last_zip_count"] = len(captures)
-                st.session_state["last_date_label"] = date_label
-                st.session_state["last_init_msgs"] = init_msgs
+                if capture_enabled:
+                    status.text(f"캡처 중: {stock_name} ({i+1}/{len(df)})")
+                    cache_key = f"{code}_{actual_date.isoformat()}"
+                    if cache_key in capture_cache:
+                        imgs, err = capture_cache[cache_key]
+                    else:
+                        imgs, err = capture_naver_chart(code, actual_date)
+                        capture_cache[cache_key] = (imgs, err)
+                    date_label = target_date.strftime("%Y%m%d")
+                    for suffix, data in imgs.items():
+                        captures[f"{fund_name}/{stock_name}_{date_label}_{suffix}.png"] = data
+                    if not imgs:
+                        errors.append(f"{stock_name}: 캡처 실패 — {err}")
+                    elif err:
+                        errors.append(f"{stock_name}: 일부 캡처 실패 — {err}")
+
+                progress.progress((i + 1) / len(df))
+
+            status.text("완료!")
+
+            excel_rows = [r for r in results if isinstance(r["price"], int)]
+            date_label = target_date.strftime("%Y%m%d")
+            excel_bytes = save_excel(excel_rows) if excel_rows else None
+
+            zip_bytes = None
+            if captures:
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for fname, data in captures.items():
+                        zf.writestr(fname, data)
+                zip_bytes = zip_buf.getvalue()
+
+            # session_state에 저장 → 다운로드 클릭 후에도 결과 유지
+            st.session_state["last_results"] = results
+            st.session_state["last_errors"] = errors
+            st.session_state["last_excel"] = excel_bytes
+            st.session_state["last_zip"] = zip_bytes
+            st.session_state["last_zip_count"] = len(captures)
+            st.session_state["last_date_label"] = date_label
+            st.session_state["last_init_msgs"] = init_msgs
 
     except Exception as e:
         st.error(f"오류: {e}")
