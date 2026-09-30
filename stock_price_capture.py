@@ -274,9 +274,36 @@ def _scroll_daily_panel(page) -> bool:
     """)
 
 
-def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str]:
+def _extract_row_price(page, target_str: str) -> int | None:
+    """캡처 화면에 실제로 보이는 기준일 행의 종가를 그대로 읽어온다.
+    (종가 API 조회 시점과 캡처 시점 사이에 오늘자 시세가 갱신/정정되면 값이 어긋날 수 있어,
+    엑셀에도 화면에 찍힌 값과 동일한 값을 쓰기 위함)
+    """
+    try:
+        return page.evaluate(
+            """(target) => {
+                const spans = Array.from(document.querySelectorAll('*'))
+                    .filter(e => e.children.length === 0 && e.textContent.trim() === target);
+                if (!spans.length) return null;
+                let node = spans[0];
+                while (node && node.tagName !== 'TR') node = node.parentElement;
+                if (!node) return null;
+                const tds = node.querySelectorAll('td');
+                if (tds.length < 2) return null;
+                const text = tds[1].textContent.trim().replace(/,/g, '');
+                const n = parseInt(text, 10);
+                return isNaN(n) ? null : n;
+            }""",
+            target_str,
+        )
+    except Exception:
+        return None
+
+
+def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str, int | None]:
     """stock.naver.com 데스크톱 종목 페이지를 그대로 열고, '일별' 탭 클릭 + 표 내부 스크롤로
     기준일 행이 로드될 때까지 내려간 뒤 캡처. 페이지 구조/내용 수정 없음.
+    반환값에 캡처 화면에서 직접 읽은 종가(scraped_price)도 포함한다.
     """
     from playwright.sync_api import sync_playwright
     target_str = f"{actual_date.year}. {actual_date.month:02d}. {actual_date.day:02d}."
@@ -307,18 +334,20 @@ def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str]:
                 _scroll_daily_panel(page)
                 page.wait_for_timeout(500)
 
+            scraped_price = None
             if found:
                 page.get_by_text(target_str, exact=True).first.scroll_into_view_if_needed()
                 page.wait_for_timeout(300)
+                scraped_price = _extract_row_price(page, target_str)
                 err = ""
             else:
                 err = "기준일 행을 찾지 못해 현재 화면만 캡처됨"
 
             img = page.screenshot(full_page=False)
             browser.close()
-            return {"전체": img}, err
+            return {"전체": img}, err, scraped_price
     except Exception as e:
-        return {}, str(e)[:200]
+        return {}, str(e)[:200], None
 
 
 # ── 엑셀 생성 (다운로드용 메모리 버퍼) ──────────────────────
@@ -502,13 +531,17 @@ if df is not None and not df.empty:
                     status.text(f"캡처 중: {stock_name} ({i+1}/{len(df)})")
                     cache_key = f"{code}_{actual_date.isoformat()}"
                     if cache_key in capture_cache:
-                        imgs, err = capture_cache[cache_key]
+                        imgs, err, scraped_price = capture_cache[cache_key]
                     else:
-                        imgs, err = capture_naver_chart(code, actual_date)
-                        capture_cache[cache_key] = (imgs, err)
+                        imgs, err, scraped_price = capture_naver_chart(code, actual_date)
+                        capture_cache[cache_key] = (imgs, err, scraped_price)
                     date_label = target_date.strftime("%Y%m%d")
                     for suffix, data in imgs.items():
                         captures[f"{fund_name}/{stock_name}_{date_label}_{suffix}.png"] = data
+                    if scraped_price and scraped_price != price:
+                        # 종가 API 조회 시점과 캡처 시점 사이 시세 갱신 등으로 값이 달라진 경우,
+                        # 캡처 화면(엑셀과 함께 배포되는 증빙 이미지)에 실제로 찍힌 값을 우선한다.
+                        results[-1]["price"] = scraped_price
                     if not imgs:
                         errors.append(f"{stock_name}: 캡처 실패 — {err}")
                     elif err:
