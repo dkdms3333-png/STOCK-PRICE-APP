@@ -238,53 +238,83 @@ def find_prev_trading_day(code: str, target_date: date) -> tuple[date | None, in
 
 # ── 스크린샷 (네이버 시세 페이지) ────────────────────────────
 # finance.naver.com/item/* 은 전부 stock.naver.com으로 이전되어 폐지됨.
-# m.stock.naver.com 페이지가 요약+차트+일별시세 표를 한 화면에 제공하며,
-# 넓은 뷰포트로 열면 PC 화면처럼 표가 넓게 펼쳐져 표시됨(같은 페이지, 반응형 레이아웃).
-CAPTURE_WIDTH = 1280
-# 뷰포트를 넉넉히 크게 잡아 실제 스크롤이 일어나지 않게 함.
-# (긴 목록을 스크롤하면 화면 밖으로 나간 행이 가상화(virtualization)로 DOM에서
-#  사라져 캡처에서 잘려나가는 문제가 있어, 스크롤 자체를 피하는 방식으로 우회)
-CAPTURE_VIEWPORT = {"width": CAPTURE_WIDTH, "height": 15000}
+# 데스크톱 stock.naver.com 페이지(종목정보+차트+호가+시세)를 그대로 캡처.
+# "시세" 패널에서 "일별" 탭을 누르면 날짜별 종가 표가 나오는데, 이 표는 페이지 전체가
+# 아니라 표 자신의 내부 스크롤(무한스크롤)로만 더 로드된다 — 그래서 창 전체를 스크롤하면
+# 위쪽 차트/호가가 화면 밖으로 밀려나므로, 표 내부만 스크롤해서 기준일 행을 불러온다.
+DATE_ROW_RE = r"^\d{4}\.\s?\d{2}\.\s?\d{2}\.$"
+CAPTURE_VIEWPORT = {"width": 1920, "height": 1200}
+
+
+def _count_daily_rows(page) -> int:
+    return page.evaluate(f"""
+        () => Array.from(document.querySelectorAll('*'))
+            .filter(e => e.children.length === 0 && /{DATE_ROW_RE}/.test(e.textContent.trim())).length
+    """)
+
+
+def _scroll_daily_panel(page) -> bool:
+    """일별시세 표의 내부 스크롤 컨테이너를 찾아 바닥까지 스크롤(더 로드 유도)."""
+    return page.evaluate(f"""
+        () => {{
+            const spans = Array.from(document.querySelectorAll('*'))
+                .filter(e => e.children.length === 0 && /{DATE_ROW_RE}/.test(e.textContent.trim()));
+            if (!spans.length) return false;
+            let node = spans[0];
+            while (node && node !== document.body) {{
+                const style = getComputedStyle(node);
+                if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight) {{
+                    node.scrollTop = node.scrollHeight;
+                    return true;
+                }}
+                node = node.parentElement;
+            }}
+            return false;
+        }}
+    """)
 
 
 def capture_naver_chart(code: str, actual_date: date) -> tuple[dict, str]:
-    """m.stock.naver.com 종목 시세 페이지를 PC 화면 크기로 그대로 열고, '더보기' 버튼만
-    클릭해 기준일 행이 로드될 때까지 내려간 뒤 캡처. 페이지 구조/내용 수정 없음.
+    """stock.naver.com 데스크톱 종목 페이지를 그대로 열고, '일별' 탭 클릭 + 표 내부 스크롤로
+    기준일 행이 로드될 때까지 내려간 뒤 캡처. 페이지 구조/내용 수정 없음.
     """
     from playwright.sync_api import sync_playwright
-    target_str = f"{actual_date.month:02d}. {actual_date.day:02d}."
-    url = f"https://m.stock.naver.com/domestic/stock/{code}/price"
+    target_str = f"{actual_date.year}. {actual_date.month:02d}. {actual_date.day:02d}."
+    url = f"https://stock.naver.com/domestic/stock/{code}/total"
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             page = browser.new_page(viewport=CAPTURE_VIEWPORT)
             page.goto(url, wait_until="networkidle", timeout=20000)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1500)
+
+            ilbyeol = page.get_by_text("일별", exact=True)
+            if ilbyeol.count() > 0:
+                ilbyeol.first.click()
+                page.wait_for_timeout(800)
 
             found = False
-            row_bottom = None
-            for _ in range(40):
+            prev_count = -1
+            for _ in range(30):
                 loc = page.get_by_text(target_str, exact=True)
                 if loc.count() > 0:
-                    row_bottom = loc.first.evaluate(
-                        "el => el.getBoundingClientRect().bottom + window.scrollY"
-                    )
                     found = True
                     break
-                more = page.query_selector("text=더보기")
-                if not more:
-                    break
-                more.click()
-                page.wait_for_timeout(400)
+                cur_count = _count_daily_rows(page)
+                if cur_count == prev_count:
+                    break  # 더 로드되지 않음 (상장 전 등으로 데이터 없음)
+                prev_count = cur_count
+                _scroll_daily_panel(page)
+                page.wait_for_timeout(500)
 
-            if found and row_bottom:
-                clip_h = int(row_bottom) + 40
-                img = page.screenshot(clip={"x": 0, "y": 0, "width": CAPTURE_WIDTH, "height": clip_h})
+            if found:
+                page.get_by_text(target_str, exact=True).first.scroll_into_view_if_needed()
+                page.wait_for_timeout(300)
                 err = ""
             else:
-                img = page.screenshot(clip={"x": 0, "y": 0, "width": CAPTURE_WIDTH, "height": 1200})
-                err = "기준일 행을 찾지 못해 상단 화면만 캡처됨"
+                err = "기준일 행을 찾지 못해 현재 화면만 캡처됨"
 
+            img = page.screenshot(full_page=False)
             browser.close()
             return {"전체": img}, err
     except Exception as e:
